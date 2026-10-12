@@ -4,6 +4,7 @@
 #include "window.hpp"
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -14,6 +15,8 @@
 namespace dusk::ui {
 
 class Pane;
+
+enum class InstalledModStatus { Active, Disabled, Failed, Suspended };
 
 class ModsWindow : public Window {
 public:
@@ -44,6 +47,7 @@ private:
     std::vector<ContextMenu::Item> mod_actions(const mods::LoadedMod& mod, bool contextMenu);
     void refresh_snapshot();
     void mark_current_entry();
+    void request_filter_update(std::string_view focusKey);
 
     std::vector<ModSnapshot> mSnapshot;
     std::vector<Component*> mEntries;
@@ -51,6 +55,10 @@ private:
     Component* mOnlineEntry = nullptr;
     mods::LoadedMod* mSelectedMod = nullptr;
     std::string mSelectedModId;
+    std::string mSearchQuery;
+    std::optional<InstalledModStatus> mStatusFilter;
+    std::string mFilterFocusKey;
+    bool mFiltersChanged = false;
     uint64_t mLoaderGeneration = 0;
     std::vector<std::pair<std::string, bool>> mQueueItems;
     std::string mFocusQueueId;

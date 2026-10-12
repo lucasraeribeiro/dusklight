@@ -1,6 +1,7 @@
 #include "mods_window.hpp"
 
 #include "clamped_text.hpp"
+#include "dropdown_button.hpp"
 #include "dusk/mods/updates.hpp"
 #include "format.hpp"
 #include "icon_button.hpp"
@@ -12,6 +13,7 @@
 #include "online_mods.hpp"
 #include "package_row.hpp"
 #include "pane.hpp"
+#include "string_button.hpp"
 
 #include <borealis/http.hpp>
 
@@ -28,6 +30,7 @@
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 
@@ -36,10 +39,61 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace dusk::ui {
 namespace {
+
+struct InstalledModFilter {
+    std::optional<InstalledModStatus> status;
+    std::string_view label;
+};
+
+constexpr std::array kInstalledModFilters{
+    InstalledModFilter{std::nullopt, "All"},
+    InstalledModFilter{InstalledModStatus::Active, "Active"},
+    InstalledModFilter{InstalledModStatus::Disabled, "Disabled"},
+    InstalledModFilter{InstalledModStatus::Failed, "Failed"},
+    InstalledModFilter{InstalledModStatus::Suspended, "Suspended"},
+};
+
+InstalledModStatus installed_mod_status(const mods::LoadedMod& mod) {
+    if (mod.loadFailed) {
+        return InstalledModStatus::Failed;
+    }
+    if (mod.active) {
+        return InstalledModStatus::Active;
+    }
+    if (mod.suspendedByProvider) {
+        return InstalledModStatus::Suspended;
+    }
+    return InstalledModStatus::Disabled;
+}
+
+bool matches_installed_mod(
+    const mods::LoadedMod& mod, std::string_view query, std::optional<InstalledModStatus> status) {
+    if (status && installed_mod_status(mod) != *status) {
+        return false;
+    }
+    if (query.empty()) {
+        return true;
+    }
+
+    const auto contains = [query](std::string_view text) {
+        return std::search(
+                   text.begin(), text.end(), query.begin(), query.end(), [](char left, char right) {
+                       // Fold ASCII only; leave UTF-8 bytes unchanged.
+                       const auto fold = [](char value) {
+                           return value >= 'A' && value <= 'Z' ?
+                                      static_cast<char>(value + ('a' - 'A')) :
+                                      value;
+                       };
+                       return fold(left) == fold(right);
+                   }) != text.end();
+    };
+    return contains(mod.metadata.name) || contains(mod.metadata.author);
+}
 
 struct ModStatus {
     const char* badgeClass = "";
@@ -47,14 +101,15 @@ struct ModStatus {
 };
 
 ModStatus mod_status(const mods::LoadedMod& mod) {
-    if (mod.loadFailed) {
+    switch (installed_mod_status(mod)) {
+    case InstalledModStatus::Failed:
         return {"error", "Failed"};
-    }
-    if (mod.active) {
+    case InstalledModStatus::Active:
         return {"success", "Active"};
-    }
-    if (mod.suspendedByProvider) {
+    case InstalledModStatus::Suspended:
         return {"suspended", "Suspended"};
+    case InstalledModStatus::Disabled:
+        break;
     }
     return {"", "Disabled"};
 }
@@ -313,6 +368,10 @@ bool ModsWindow::select_mod(std::string_view id) {
         return false;
     }
     mContextMenu.dismiss();
+    mSearchQuery.clear();
+    mStatusFilter.reset();
+    mFiltersChanged = false;
+    mFilterFocusKey.clear();
     mSelectedModId = id;
     mSelectedMod = nullptr;
     mSelection = Selection::Mod;
@@ -367,6 +426,11 @@ bool ModsWindow::focus() {
                 mFocusSelectedMod = false;
                 return true;
             }
+        }
+    }
+    if (mSelection == Selection::Mod && mEntryMods.empty()) {
+        if (auto* search = mContentRoot->QuerySelector("[focus-key=installed-search]")) {
+            return search->Focus(true);
         }
     }
     return Window::focus();
@@ -453,6 +517,12 @@ void ModsWindow::build_online(Pane& pane) {
     mark_current_entry();
 }
 
+void ModsWindow::request_filter_update(std::string_view focusKey) {
+    mFiltersChanged = true;
+    mFilterFocusKey = focusKey;
+    mSelection = Selection::Mod;
+}
+
 void ModsWindow::build_content(Rml::Element* content) {
     mEntries.clear();
     mEntryMods.clear();
@@ -472,7 +542,68 @@ void ModsWindow::build_content(Rml::Element* content) {
     if (hasInstalledMods) {
         append(listPane.root(), "mod-list-separator");
     }
+    auto& search = listPane.add_child<StringButton>(StringButton::Props{
+        .key = "Search",
+        .getValue = [this] { return mSearchQuery; },
+        .setValue =
+            [this](Rml::String value) {
+                if (mSearchQuery != value) {
+                    mSearchQuery = std::move(value);
+                    request_filter_update("installed-search");
+                }
+            },
+        .maxLength = 100,
+    });
+    search.root()->SetAttribute("focus-key", "installed-search");
+    search.root()->SetClass("compact", true);
+    search.set_tooltip("Search installed mods by name or author.");
+
+    std::vector<DropdownButton::Option> statusOptions;
+    for (const auto& option : kInstalledModFilters) {
+        statusOptions.push_back({Rml::String{option.label}});
+    }
+    auto& status = listPane.add_child<DropdownButton>(DropdownButton::Props{
+        .key = "Status",
+        .options = std::move(statusOptions),
+        .getValue =
+            [this] {
+                const auto selected = std::ranges::find(
+                    kInstalledModFilters, mStatusFilter, &InstalledModFilter::status);
+                return selected == kInstalledModFilters.end() ?
+                           0 :
+                           static_cast<int>(selected - kInstalledModFilters.begin());
+            },
+        .setValue =
+            [this](int index) {
+                if (index < 0 || index >= static_cast<int>(kInstalledModFilters.size())) {
+                    return;
+                }
+                const auto value = kInstalledModFilters[index].status;
+                if (mStatusFilter != value) {
+                    mStatusFilter = value;
+                    request_filter_update("installed-status");
+                }
+            },
+    });
+    status.root()->SetAttribute("focus-key", "installed-status");
+    status.root()->SetClass("compact", true);
+    auto& reset = listPane.add_button("Reset filters");
+    reset.root()->SetAttribute("focus-key", "installed-reset");
+    reset.root()->SetClass("compact", true);
+    reset.on_pressed([this] {
+        if (!mSearchQuery.empty() || mStatusFilter) {
+            mSearchQuery.clear();
+            mStatusFilter.reset();
+            request_filter_update("installed-reset");
+        }
+    });
+
+    auto* count = listPane.add_text("");
+    count->SetClass("mod-result-count", true);
     for (auto& trackedMod : mods::ModLoader::instance().mods()) {
+        if (!matches_installed_mod(trackedMod, mSearchQuery, mStatusFilter)) {
+            continue;
+        }
         auto& entry = listPane.add_child<ModListEntry>(trackedMod);
         mEntries.push_back(&entry);
         mEntryMods.push_back(&trackedMod);
@@ -484,14 +615,17 @@ void ModsWindow::build_content(Rml::Element* content) {
             mark_current_entry();
         });
     }
+    set_text_content(count, fmt::format("{} of {} installed mods", mEntryMods.size(),
+                                mods::ModLoader::instance().mods().size()));
     if (!hasInstalledMods) {
         listPane.add_text("No mods installed.");
-        mSelection = Selection::Online;
+    } else if (mEntryMods.empty()) {
+        listPane.add_text("No mods match these filters.");
     }
     if (selected_utility()) {
         build_online(detailPane);
         mOnlineEntry->set_selected(true);
-    } else if (hasInstalledMods) {
+    } else if (!mEntryMods.empty()) {
         mSelection = Selection::Mod;
         const auto selected = std::ranges::find_if(
             mEntryMods, [this](const auto* mod) { return mod->metadata.id == mSelectedModId; });
@@ -501,6 +635,10 @@ void ModsWindow::build_content(Rml::Element* content) {
     } else {
         mSelectedMod = nullptr;
         mSelectedModId.clear();
+        mRoot->SetClass("image-header", false);
+        detailPane.root()->RemoveAttribute("mod-id");
+        detailPane.add_text(hasInstalledMods ? "No matching mods. Change or reset the filters." :
+                                               "No mods installed.");
     }
     mark_current_entry();
 }
@@ -632,6 +770,7 @@ void ModsWindow::mark_current_entry() {
 void ModsWindow::update() {
     ZoneScopedN("Mod manager update");
     auto& loader = mods::ModLoader::instance();
+    const bool filtersChanged = std::exchange(mFiltersChanged, false);
     bool dirty = loader.generation() != mLoaderGeneration;
     if (dirty) {
         mSelectedMod = nullptr;
@@ -662,6 +801,7 @@ void ModsWindow::update() {
         queueItems.emplace_back(item.id, mods::queue::is_completed(item.state));
     }
     dirty |= queueItems != mQueueItems;
+    dirty |= filtersChanged;
     if (dirty) {
         mContextMenu.dismiss();
         ZoneScopedN("Mod manager rebuild");
@@ -672,10 +812,11 @@ void ModsWindow::update() {
             previousDesaturation = *image->GetProperty(desaturation);
         }
         auto* list = mContentRoot->QuerySelector("pane.mod-list");
-        const float listScrollTop = list != nullptr ? list->GetScrollTop() : 0.0f;
+        const float listScrollTop =
+            !filtersChanged && list != nullptr ? list->GetScrollTop() : 0.0f;
         auto* focused = mDocument != nullptr ? mDocument->GetFocusLeafNode() : nullptr;
-        std::string focusKey;
-        for (auto* node = focused; node != nullptr && node != mContentRoot;
+        std::string focusKey = std::exchange(mFilterFocusKey, std::string{});
+        for (auto* node = focused; focusKey.empty() && node != nullptr && node != mContentRoot;
             node = node->GetParentNode())
         {
             if (node->HasAttribute("focus-key")) {
@@ -694,7 +835,7 @@ void ModsWindow::update() {
         }
         rebuild_content();
         mDocument->UpdateDocument();
-        if (hadContentFocus) {
+        if (hadContentFocus || filtersChanged) {
             auto* restored = focusKey.empty() ? nullptr :
                                                 mContentRoot->QuerySelector(
                                                     fmt::format("[focus-key=\"{}\"]", focusKey));
@@ -715,10 +856,17 @@ void ModsWindow::update() {
                     utility->root()->Focus(true);
                 }
             } else {
+                bool restoredMod = false;
                 for (size_t i = 0; i < mEntryMods.size(); ++i) {
                     if (mEntryMods[i] == mSelectedMod) {
-                        mEntries[i]->root()->Focus(true);
+                        restoredMod = mEntries[i]->root()->Focus(true);
                         break;
+                    }
+                }
+                if (!restoredMod) {
+                    if (auto* search = mContentRoot->QuerySelector("[focus-key=installed-search]"))
+                    {
+                        search->Focus(true);
                     }
                 }
             }
@@ -735,7 +883,7 @@ void ModsWindow::update() {
             }
         }
         if (auto* refreshedDetail = mContentRoot->QuerySelector("pane.mod-detail")) {
-            refreshedDetail->SetScrollTop(detailScrollTop);
+            refreshedDetail->SetScrollTop(previousModId == mSelectedModId ? detailScrollTop : 0.0f);
         }
         if (auto* refreshedList = mContentRoot->QuerySelector("pane.mod-list")) {
             refreshedList->SetScrollTop(listScrollTop);

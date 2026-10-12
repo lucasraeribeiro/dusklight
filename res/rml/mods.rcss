@@ -31,6 +31,13 @@ mod-list-separator {
     background-color: rgba(var(--color-border-rgb), 30%);
 }
 
+pane.mod-list > .mod-result-count {
+    flex: 0 0 auto;
+    padding: var(--space-sm) 10dp;
+    font-size: var(--font-size-xs);
+    color: rgba(var(--color-text-rgb), 50%);
+}
+
 mod-info-row {
     display: flex;
     align-items: center;
